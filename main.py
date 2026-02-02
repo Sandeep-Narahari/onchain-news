@@ -205,6 +205,162 @@ async def trigger_scrape():
     return {"status": "Scrape job started"}
 
 
+import secrets
+import hashlib
+from fastapi import Request, Depends, Security
+from fastapi.security import APIKeyHeader
+from database import (
+    upsert_user,
+    get_user,
+    create_api_key,
+    get_user_api_keys,
+    revoke_api_key,
+    validate_api_key,
+    get_user_credits,
+    deduct_credit,
+    log_api_usage,
+    get_user_usage_stats,
+    verify_payment_transaction
+)
+
+# ... (Previous imports remain, but consolidated below for clarity) ...
+
+# -------------------------------------------------------------------
+# Security & Auth Models
+# -------------------------------------------------------------------
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+class SIWELogin(BaseModel):
+    address: str
+    message: str
+    signature: str
+
+class APIKeyCreate(BaseModel):
+    name: str
+
+# -------------------------------------------------------------------
+# Auth Endpoints
+# -------------------------------------------------------------------
+@app.post("/auth/login")
+async def login(data: SIWELogin):
+    """
+    Verify SIWE signature and log user in.
+    Note: For production, implement real SIWE verification using siwe-py.
+    Here we assume the frontend sends a valid signature and we just upsert the user for MVP.
+    """
+    # TODO: Add siwe library verification: Use siwe.SiweMessage(message).verify(signature)
+    address = data.address.lower()
+    success = upsert_user(address)
+    if not success:
+        raise HTTPException(status_code=500, detail="Login failed")
+    return {"status": "ok", "address": address}
+
+@app.get("/users/me")
+async def get_profile(address: str):
+    """Get user profile (requires address param for now)."""
+    user = get_user(address)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# -------------------------------------------------------------------
+# API Key Management
+# -------------------------------------------------------------------
+@app.post("/api-keys")
+async def generate_key(data: APIKeyCreate, user_address: str):
+    """Generate a new API key for the user."""
+    # Generate a secure random key
+    raw_key = f"sk_live_{secrets.token_urlsafe(32)}"
+    # Hash it for storage
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    
+    result = create_api_key(user_address, key_hash, data.name)
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create key")
+    
+    # Return the raw key ONLY ONCE
+    return {
+        "id": result["id"],
+        "name": result["name"],
+        "key": raw_key,  # Show this only now
+        "created_at": result["created_at"]
+    }
+
+@app.get("/api-keys")
+async def list_keys(user_address: str):
+    return get_user_api_keys(user_address)
+
+@app.delete("/api-keys/{key_id}")
+async def revoke_key(key_id: str, user_address: str):
+    success = revoke_api_key(key_id, user_address)
+    if not success:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"status": "revoked"}
+
+# -------------------------------------------------------------------
+# Billing Endpoints
+# -------------------------------------------------------------------
+@app.get("/billing/balance")
+async def get_balance(user_address: str):
+    credits = get_user_credits(user_address)
+    return {"credits": credits}
+
+@app.get("/billing/usage")
+async def get_usage(user_address: str):
+    stats = get_user_usage_stats(user_address)
+    return stats
+
+@app.post("/billing/verify")
+async def verify_payment(payload: dict):
+    tx_hash = payload.get("tx_hash")
+    user_address = payload.get("user_address")
+    
+    if not tx_hash or not user_address:
+        raise HTTPException(status_code=400, detail="Missing tx_hash or user_address")
+        
+    result = verify_payment_transaction(tx_hash, user_address)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+        
+    return result
+
+# -------------------------------------------------------------------
+# Middleware / Dependency for API Key Protection
+# -------------------------------------------------------------------
+async def verify_api_key(request: Request, api_key: str = Security(API_KEY_HEADER)):
+    """Dependency to validate API key and deduct credits."""
+    # Skip for public/auth/management endpoints
+    if request.url.path in ["/", "/docs", "/openapi.json", "/auth/login", "/status", "/news"]:
+        # If accessing /news without key, maybe allow restricted access?
+        # For now, let's say /news requires a key if we want to monetize it.
+        # But wait, frontend needs /news. Let's make /news public for now OR req auth.
+        # Implementation decision: /news is protected DB access.
+        pass
+
+    if not api_key:
+        # Allow unauthorized for now for testing, OR enforced?
+        # Let's enforce for specific endpoints if needed.
+        return None
+
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    key_data = validate_api_key(key_hash)
+    
+    if not key_data:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    
+    # Deduct credit
+    user_address = key_data["user_address"]
+    allowed = deduct_credit(user_address, 1) # 1 credit per call
+    
+    log_api_usage(key_data["id"], user_address, request.url.path, 200) # Log tentative success
+    
+    if not allowed:
+        raise HTTPException(status_code=402, detail="Insufficient credits")
+    
+    return key_data
+
+# ... (Rest of existing endpoints) ...
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
